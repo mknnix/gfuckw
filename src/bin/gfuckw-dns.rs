@@ -1,16 +1,16 @@
-/// A DNS anti-filtering tool that automatically determines whether a domain is being censored by GFW and triages it based on the results. This keeps local websites from being slowed down (with CDN-friendly results), and prevents other international domains from being interfered with by GFW.
-
-//use std::net::UdpSocket;
 use std::net::SocketAddr;
 use std::collections::HashMap;
+use std::time::Duration;
+use std::io::{Error, ErrorKind};
+use std::str::FromStr;
+
 use smol::net::{UdpSocket, TcpListener, TcpStream};
 use smol::io::{AsyncReadExt, AsyncWriteExt};
+use smol_timeout::TimeoutExt;
 use dns_parser::Packet as DNSPacket;
-use std::time::Duration;
-use std::sync::Arc;
 
 use anyhow;
-
+use fastrand;
 use clap::Parser;
 
 #[derive(clap::Parser, Debug, Clone)]
@@ -36,15 +36,16 @@ struct Args {
 }
 
 #[derive(Debug, Copy, Clone)]
-enum DetectMode {
-    TCP_RST,
-    ROOT_NS,
+pub enum DetectMode {
+    TcpReset,
+    RootNS,
 }
+
 impl DetectMode {
     pub fn from(a: &str) -> Self {
         match a {
-            "tcp-rst" => Self::TCP_RST,
-            "root-ns" => Self::ROOT_NS,
+            "tcp-rst" => Self::TcpReset,
+            "root-ns" => Self::RootNS,
             _ => {
                 panic!("invalid detect-mode!");
             }
@@ -53,7 +54,7 @@ impl DetectMode {
 }
 
 #[derive(Debug)]
-struct Detector {
+pub struct Detector {
     cache: HashMap<String, bool>,
     mode: DetectMode,
     timeout: Duration,
@@ -69,41 +70,41 @@ impl Detector {
 
     // detect cached
     pub async fn is_censored(&mut self, name: &str) -> anyhow::Result<bool> {
-        if let Some(ret) = self.cache.get(name) {
-            Ok(*ret)
+        if let Some(wether) = self.cache.get(name) {
+            Ok(*wether)
         } else {
             let start = std::time::Instant::now();
-            let ret = self._detect(name).await?;
-            println!("detected {:?}(censored={:?}) used time {:?}", name, ret, start.elapsed());
-            self.cache.insert(name.to_string(), ret);
-            Ok(ret)
+
+            let result = self._detect(name, self.mode)
+                .timeout(self.timeout)
+                .await.expect(&format!("Timed out ({:?}) in Detecting!", self.timeout));
+
+            let wether = result?;
+
+            println!("DEBUG detected {:?}(censored={:?}) used time {:?}", name, wether, start.elapsed());
+            self.cache.insert(name.to_string(), wether);
+            Ok(wether)
         }
     }
 
     // uncached detect
-    async fn _detect(&self, name: &str) -> anyhow::Result<bool> {
+    async fn _detect(&self, name: &str, mode: DetectMode) -> anyhow::Result<bool> {
         let mut censored: Option<bool> = None;
-        let query: Vec<u8> = {
-            let mut b = dns_parser::Builder::new_query(0u16, true);
-            b.add_question(name,
-                true,
-                dns_parser::QueryType::TXT,
-                dns_parser::QueryClass::CH);
-            b.build().unwrap()
-        };
 
-        use std::io::{Error, ErrorKind};
+        match mode {
+            DetectMode::TcpReset => {
+                let query: Vec<u8> = {
+                    let mut b = dns_parser::Builder::new_query(fastrand::u16(..), fastrand::bool());
+                    b.add_question(
+                        name,
+                        fastrand::bool(),
+                        dns_parser::QueryType::TXT,
+                        dns_parser::QueryClass::CH
+                    );
+                    b.build().unwrap()
+                };
+                assert!(query.len() < 2000);
 
-
-        let timeout = async {
-            smol::Timer::after(self.timeout).await;
-            eprintln!("ERROR Timeout in Detecting! ({})", name);
-            Err(Error::new(ErrorKind::TimedOut, "TCP Timeout in detecting!"))
-        };
-
-
-        match self.mode {
-            DetectMode::TCP_RST => {
                 let servers: Vec<SocketAddr>=
                 vec![
                     "101.102.103.104:53"
@@ -129,7 +130,7 @@ impl Detector {
                 det.write_all(&msg).await?;
 
                 let mut recv: [u8; 1] = [0u8];
-                match smol::future::race(det.read(&mut recv), timeout).await {
+                match det.read(&mut recv).await {
                     Ok(size) => {
                         if size <= 0 {
                             censored = Some(true);
@@ -138,14 +139,11 @@ impl Detector {
                         }
                     },
                     Err(error) => {
-                        if error.kind() == ErrorKind::TimedOut {
-                            return Err(error.into());
-                        }
                         censored = Some(true);
                     }
                 }
             },
-            DetectMode::ROOT_NS => {
+            DetectMode::RootNS => {
                 panic!("RootNS mode TODO");
             }
         }
@@ -155,9 +153,8 @@ impl Detector {
 
 }
 
-async fn _main() {
-    use std::io::{Error, ErrorKind};
-
+/// A DNS anti-filtering tool that automatically determines whether a domain is being censored by GFW and triages it based on the results. This keeps local websites from being slowed down (with CDN-friendly results), and prevents other international domains from being interfered with by GFW.
+async fn async_main() {
     let args = Args::parse();
 
     let mode = DetectMode::from(&args.detect_mode);
@@ -203,15 +200,12 @@ async fn _main() {
             };
 
             let client_socket = smol::net::UdpSocket::bind({
-                let mut ip = String::new();
                 if censored {
-                    let id = pkt.header.id.to_be_bytes();
-                    ip.extend(format!("127.64.{}.{}", id[0], id[1]).chars());
+                    let id = pkt.header.id.to_ne_bytes();
+                    format!("127.64.{}.{}:0", id[0], id[1])
                 } else {
-                    ip.extend("[::]".chars());
+                    format!("[::]:0")
                 }
-                ip.extend(":0".chars());
-                ip
             }).await.unwrap();
             println!("DEBUG client socket binded address: {:?}", client_socket.local_addr() );
 
@@ -219,18 +213,18 @@ async fn _main() {
 
             for _ in 0..3 {
                 client_socket.send(&msg).await.unwrap();
+                smol::Timer::after(Duration::from_secs_f64(0.05)).await;
             }
 
             let mut buf = [0u8; 2000];
-            let len = match smol::future::race(async {
-                smol::Timer::after(Duration::from_secs(10)).await;
-                Err(Error::new(ErrorKind::TimedOut, "Timeout (ten seconds) at reading Upstream DNS UDP"))
-            }, client_socket.recv(&mut buf)).await {
-                Ok(v)=>v,
-                Err(e)=>{
-                    if e.kind() == ErrorKind::TimedOut {
-                        eprintln!("ERROR {:?}", e);
-                    }
+            let recv_timeout = Duration::from_secs_f64(5.0);
+            let len: usize = match
+                client_socket.recv(&mut buf)
+                .timeout(recv_timeout).await
+                .expect("Timed out in reading DNS response from upstream UDP") {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("ERROR {:?}", e);
                     0
                 }
             };
@@ -242,7 +236,7 @@ async fn _main() {
     }
 }
 
-fn main(){
-    smol::block_on(_main());
+fn main() {
+    smol::block_on(async_main())
 }
 

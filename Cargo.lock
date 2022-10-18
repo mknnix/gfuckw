@@ -273,18 +273,20 @@ dependencies = [
  "futures-io",
  "memchr",
  "parking",
- "pin-project-lite",
+ "pin-project-lite 0.2.9",
  "waker-fn",
 ]
 
 [[package]]
-name = "gfwdns"
-version = "0.1.0"
+name = "gfuckw"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
  "dns-parser",
+ "fastrand",
  "smol",
+ "smol-timeout",
 ]
 
 [[package]]
@@ -365,6 +367,12 @@ name = "parking"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "427c3892f9e783d91cc128285287e70a59e206ca452770ece88a76f7a3eddd72"
+
+[[package]]
+name = "pin-project-lite"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "257b64915a082f7811703966789728173279bdebb956b143dbcd23f6f970a777"
 
 [[package]]
 name = "pin-project-lite"
@@ -478,6 +486,16 @@ dependencies = [
  "blocking",
  "futures-lite",
  "once_cell",
+]
+
+[[package]]
+name = "smol-timeout"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "847d777e2c6c166bad26264479e80a9820f3d364fcb4a0e23cd57bbfa8e94961"
+dependencies = [
+ "async-io",
+ "pin-project-lite 0.1.12",
 ]
 
 [[package]]
