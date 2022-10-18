@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use smol::net::{UdpSocket, TcpListener, TcpStream};
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use dns_parser::Packet as DNSPacket;
+use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow;
 
@@ -33,7 +35,7 @@ struct Args {
     detect_mode: String,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 enum DetectMode {
     TCP_RST,
     ROOT_NS,
@@ -50,15 +52,18 @@ impl DetectMode {
     }
 }
 
+#[derive(Debug)]
 struct Detector {
     cache: HashMap<String, bool>,
     mode: DetectMode,
+    timeout: Duration,
 }
 impl Detector {
-    pub fn new(mode: DetectMode) -> Self {
+    pub fn new(mode: DetectMode, timeout: Duration) -> Self {
         Self {
             cache: HashMap::new(),
             mode,
+            timeout,
         }
     }
 
@@ -69,7 +74,7 @@ impl Detector {
         } else {
             let start = std::time::Instant::now();
             let ret = self._detect(name).await?;
-            println!("detected {}(censored={:?}) used time {:?}", name, ret, start.elapsed());
+            println!("detected {:?}(censored={:?}) used time {:?}", name, ret, start.elapsed());
             self.cache.insert(name.to_string(), ret);
             Ok(ret)
         }
@@ -87,18 +92,35 @@ impl Detector {
             b.build().unwrap()
         };
 
+        use std::io::{Error, ErrorKind};
+
+
+        let timeout = async {
+            smol::Timer::after(self.timeout).await;
+            eprintln!("ERROR Timeout in Detecting! ({})", name);
+            Err(Error::new(ErrorKind::TimedOut, "TCP Timeout in detecting!"))
+        };
+
+
         match self.mode {
             DetectMode::TCP_RST => {
                 let servers: Vec<SocketAddr>=
                 vec![
                     "101.102.103.104:53"
                         .parse().unwrap(),
+                    "8.8.8.8:53"
+                        .parse().unwrap(),
+                    "1.0.0.1:53"
+                        .parse().unwrap(),
                     "8.8.4.4:53"
                         .parse().unwrap(),
                     "80.80.80.80:53"
                         .parse().unwrap(),
+                    "101.101.101.101:53"
+                        .parse().unwrap(),
                 ];
                 let mut det = smol::net::TcpStream::connect(&servers[..]).await?;
+                det.set_nodelay(true)?;
 
                 let mut msg: Vec<u8> = vec![];
                 msg.extend( (query.len() as u16).to_be_bytes() ); // length encoded as big endian
@@ -107,7 +129,7 @@ impl Detector {
                 det.write_all(&msg).await?;
 
                 let mut recv: [u8; 1] = [0u8];
-                match det.read(&mut recv).await {
+                match smol::future::race(det.read(&mut recv), timeout).await {
                     Ok(size) => {
                         if size <= 0 {
                             censored = Some(true);
@@ -115,7 +137,10 @@ impl Detector {
                             censored = Some(false);
                         }
                     },
-                    Err(_) => {
+                    Err(error) => {
+                        if error.kind() == ErrorKind::TimedOut {
+                            return Err(error.into());
+                        }
                         censored = Some(true);
                     }
                 }
@@ -131,59 +156,88 @@ impl Detector {
 }
 
 async fn _main() {
-    use std::io::Write;
+    use std::io::{Error, ErrorKind};
 
     let args = Args::parse();
+
     let mode = DetectMode::from(&args.detect_mode);
-    let mut detector = Detector::new(mode);
+    let mut detector = Detector::new(mode, Duration::from_secs(2));
 
     let listen_socket = smol::net::UdpSocket::bind(args.listen).await.unwrap();
-    let listen_socket = std::sync::Arc::new(listen_socket);
+    //let listen_socket = std::sync::Arc::new(listen_socket);
 
-    let mut buf: Vec<u8> = Vec::from([0u8; 65535]);
+    let mut buf = [0u8; 65599];
     loop {
-        let (len, peer) = (&listen_socket).recv_from(&mut buf).await.unwrap();
-        let msg = (&buf[..len]).to_vec();
-        //println!("DEBUG recved {:?} from {:?}", msg, peer);
+        let (len, from) = (&listen_socket).recv_from(&mut buf).await.unwrap();
+        let msg = buf[..len].to_vec();
+
+        let listen_socket = listen_socket.clone();
 
         let pkt = match DNSPacket::parse(&msg) {
             Ok(v) => v,
             Err(_) => { continue; }
         };
-        if pkt.questions.len() <= 0 {
-            continue;
-        }
 
+        if pkt.questions.len() <= 0 { continue; }
         if pkt.questions.len() != 1 {
-            println!("INFO cannot handle questions field more than one!");
+             println!("INFO cannot handle questions field more than one!");
+             continue;
         }
 
         let domain = pkt.questions[0].qname.to_string();
         let censored: bool = match detector.is_censored(&domain).await {
             Ok(v) => v,
             Err(err) => {
-                eprintln!("ERROR (domain:{}) cannot detect the status of censorship! discard UDP packet... / ERROR: {:?}", domain, err);
+                eprintln!("ERROR (domain:{}) cannot detect the status of censorship! discard UDP packet... / ERROR: {:?}", &domain, err);
                 continue;
             }
         };
 
-        let listen_socket = listen_socket.clone();
-
+        let msg = msg.clone();
+        //println!("DEBUG recved {:?} from {:?}", msg, peer);
         smol::spawn(async move {
-            let client_socket = smol::net::UdpSocket::bind("[::]:0").await.unwrap();
-            println!("DEBUG client socket binded address: {:?}", client_socket.local_addr() );
-
             let resolver = if censored {
                 args.true_resolver
             } else {
                 args.local_resolver
             };
-            client_socket.connect(resolver).await.unwrap();
-            for _ in 0..3 {                                             client_socket.send(&msg).await.unwrap();             }
 
-            let mut buf = [0u8; 65599];
-            let len = client_socket.recv(&mut buf).await.unwrap();
-            listen_socket.send_to(&buf[..len], &peer).await.unwrap();
+            let client_socket = smol::net::UdpSocket::bind({
+                let mut ip = String::new();
+                if censored {
+                    let id = pkt.header.id.to_be_bytes();
+                    ip.extend(format!("127.64.{}.{}", id[0], id[1]).chars());
+                } else {
+                    ip.extend("[::]".chars());
+                }
+                ip.extend(":0".chars());
+                ip
+            }).await.unwrap();
+            println!("DEBUG client socket binded address: {:?}", client_socket.local_addr() );
+
+            client_socket.connect(resolver).await.unwrap();
+
+            for _ in 0..3 {
+                client_socket.send(&msg).await.unwrap();
+            }
+
+            let mut buf = [0u8; 2000];
+            let len = match smol::future::race(async {
+                smol::Timer::after(Duration::from_secs(10)).await;
+                Err(Error::new(ErrorKind::TimedOut, "Timeout (ten seconds) at reading Upstream DNS UDP"))
+            }, client_socket.recv(&mut buf)).await {
+                Ok(v)=>v,
+                Err(e)=>{
+                    if e.kind() == ErrorKind::TimedOut {
+                        eprintln!("ERROR {:?}", e);
+                    }
+                    0
+                }
+            };
+
+            if len > 0 {
+                listen_socket.send_to(&buf[..len], &from).await.unwrap();
+            }
         }).detach();
     }
 }
