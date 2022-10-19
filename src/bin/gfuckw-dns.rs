@@ -78,10 +78,11 @@ impl Detector {
         } else {
             let start = std::time::Instant::now();
 
-            let result = if let Some(res) = self._detect(&name, self.mode).timeout(self.timeout).await { res } else {
-                return Err(
+            let result = match self._detect(&name, self.mode).timeout(self.timeout).await {
+                Some(r) => r,
+                None => Err(
                     anyhow::Error::msg(format!("ERROR Timed out ({:?}) in Detecting (domain={})!", self.timeout, &name))
-                );
+                )
             };
 
             let wether = result?;
