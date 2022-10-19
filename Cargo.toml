@@ -1,6 +1,6 @@
 [package]
 name = "gfuckw"
-version = "0.2.3"
+version = "0.2.4-alpha0"
 edition = "2021"
 authors = [ "Mokona Modoki" ]
 license = "GPL-3.0"
