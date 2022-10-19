@@ -70,18 +70,23 @@ impl Detector {
 
     // detect cached
     pub async fn is_censored(&mut self, name: &str) -> anyhow::Result<bool> {
-        if let Some(wether) = self.cache.get(name) {
+        let mut name = name.to_string();
+        name.make_ascii_lowercase();
+
+        if let Some(wether) = self.cache.get(&name) {
             Ok(*wether)
         } else {
             let start = std::time::Instant::now();
 
-            let result = self._detect(name, self.mode)
-                .timeout(self.timeout)
-                .await.expect(&format!("Timed out ({:?}) in Detecting!", self.timeout));
+            let result = if let Some(res) = self._detect(&name, self.mode).timeout(self.timeout).await { res } else {
+                return Err(
+                    anyhow::Error::msg(format!("ERROR Timed out ({:?}) in Detecting (domain={})!", self.timeout, &name))
+                );
+            };
 
             let wether = result?;
 
-            println!("DEBUG detected {:?}(censored={:?}) used time {:?}", name, wether, start.elapsed());
+            println!("DEBUG detected {:?}(censored={:?}) used time {:?}", &name, wether, start.elapsed());
             self.cache.insert(name.to_string(), wether);
             Ok(wether)
         }
@@ -120,7 +125,7 @@ impl Detector {
                     "101.101.101.101:53"
                         .parse().unwrap(),
                 ];
-                let mut det = smol::net::TcpStream::connect(&servers[..]).await?;
+                let mut det = TcpStream::connect(&servers[..]).await?;
                 det.set_nodelay(true)?;
 
                 let mut msg: Vec<u8> = vec![];
@@ -139,6 +144,7 @@ impl Detector {
                         }
                     },
                     Err(error) => {
+                        println!("DEBUG detecting tcp mode: tcp socket error: {:?}", error);
                         censored = Some(true);
                     }
                 }
@@ -160,7 +166,7 @@ async fn async_main() {
     let mode = DetectMode::from(&args.detect_mode);
     let mut detector = Detector::new(mode, Duration::from_secs(2));
 
-    let listen_socket = smol::net::UdpSocket::bind(args.listen).await.unwrap();
+    let listen_socket = UdpSocket::bind(args.listen).await.unwrap();
     //let listen_socket = std::sync::Arc::new(listen_socket);
 
     let mut buf = [0u8; 65599];
@@ -199,7 +205,7 @@ async fn async_main() {
                 args.local_resolver
             };
 
-            let client_socket = smol::net::UdpSocket::bind({
+            let client_socket = UdpSocket::bind({
                 if censored {
                     let id = pkt.header.id.to_ne_bytes();
                     format!("127.64.{}.{}:0", id[0], id[1])
