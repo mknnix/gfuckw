@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind};
+//use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
-use std::str::FromStr;
+//use std::str::FromStr;
 use std::time::Duration;
 
 use dns_parser::Packet as DNSPacket;
@@ -101,19 +101,28 @@ impl Detector {
 
     // uncached detect
     async fn _detect(&self, name: &str, mode: DetectMode) -> anyhow::Result<bool> {
-        let mut censored: Option<bool> = None;
+        let censored: Option<bool>;
 
         let query: Vec<u8> = {
+            use dns_parser::QueryType;
             let mut b = dns_parser::Builder::new_query(fastrand::u16(..), fastrand::bool());
             b.add_question(
                 name,
                 fastrand::bool(),
-                dns_parser::QueryType::TXT,
+                if fastrand::bool() {
+                    QueryType::AAAA
+                } else {
+                    QueryType::A
+                },
                 dns_parser::QueryClass::CH,
             );
             b.build().unwrap()
         };
-        assert!(query.len() < 2000);
+        if query.len() > 2000 {
+            return Err(anyhow::Error::msg(
+                "unexcepted domain name length too long!",
+            ));
+        }
 
         match mode {
             DetectMode::TcpReset => {
@@ -162,7 +171,7 @@ impl Detector {
                     "192.58.128.30:53",
                     //"202.12.27.33:53",
                 ];
-                let mut det = UdpSocket::bind("[::]:0").await?;
+                let det = UdpSocket::bind("[::]:0").await?;
                 for ip in servers {
                     det.send_to(&query, ip).await?;
                 }
@@ -179,14 +188,19 @@ impl Detector {
                         if pkt.answers.len() <= 0 {
                             return Ok(false);
                         }
-                        if pkt.answers[0].cls != Class::IN {
-                            return Ok(false);
-                        }
-                        if let RData::TXT(_) = pkt.answers[0].data {
-                            return Ok(false);
-                        } else {
+                        if pkt.answers[0].cls != Class::CH {
                             return Ok(true);
                         }
+                        return {
+                            match pkt.answers[0].data {
+                                RData::A(_) => Ok(true),
+                                RData::AAAA(_) => Ok(true),
+                                _ => Err(anyhow::Error::msg(format!(
+                                    "unsure wether domain {:?} censored... {:?}",
+                                    name, pkt
+                                ))),
+                            }
+                        };
                     } else {
                         return Ok(false);
                     }
