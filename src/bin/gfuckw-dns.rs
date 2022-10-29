@@ -13,6 +13,18 @@ use anyhow;
 use clap::Parser;
 use fastrand;
 
+use rusqlite;
+const DB_EXEC_SQL_TABLE: &str = "CREATE TABLE IF NOT EXISTS stat (name TEXT NOT NULL PRIMARY KEY, censored INT NOT NULL, timestamp INT NOT NULL);";
+const DB_EXEC_SQL_SELECT: &str = "SELECT * FROM stat WHERE name = ? LIMIT 1;";
+
+const STATE_TIMEOUT_SEC: usize = 86400;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct State {
+    name: String, censored: bool,
+    time: SystemTime,
+}
+
 #[derive(clap::Parser, Debug, Clone)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
@@ -55,21 +67,54 @@ impl DetectMode {
 
 #[derive(Debug)]
 pub struct Detector {
-    cache: HashMap<String, bool>,
     mode: DetectMode,
     timeout: Duration,
+    db: rusqlite::Connection,
 }
 impl Detector {
-    pub fn new(mode: DetectMode, timeout: Duration) -> Self {
+    pub fn new(db_path: &str,mode: DetectMode, timeout: Duration) -> Self {
+        let db = if db_path.len() <= 0 {
+            rusqlite::Connection::open_in_memory().unwrap()
+        } else {
+            rusqlite::Connection::open(db_path).unwrap()
+        };
+        db.execute( DB_EXEC_SQL_TABLE, () ).unwrap();
+
         Self {
-            cache: HashMap::new(),
+            //cache: HashMap::new(),
             mode,
             timeout,
+            db,
         }
     }
 
+    fn db_cached(&self, name: &str) -> Option<State> {
+        let res: Option<State> = match self.db.execute( DB_EXEC_SQL_SELECT, [name] ) {
+            Ok(lines) => {
+                lines[0]
+            },
+            Err(e) => {},
+        };
+        if res.is_none() {
+            println!("INFO sqlite3.db: getting {:?} is not hit");
+        } else {
+            println!("DEBUG sqlite3.db: get domain {:?} is hit! :)");
+        }
+
+        res
+    }
+
+    // Cache-able and Paraell-able Censoring detect method, based on SQLite
+    pub async fn db_censored(&self, name: &str) -> anyhow::Result<State> {
+        if let Some(lines) = db_cached(name) {
+            return;
+        }
+
+        let r = self._detect();
+    }
+
     // detect cached
-    pub async fn is_censored(&mut self, name: &str) -> anyhow::Result<bool> {
+    pub async fn is_censored(&mut self, name: &str) -> anyhow::Result<State> {
         let mut name = name.to_string();
         name.make_ascii_lowercase();
 
@@ -100,8 +145,14 @@ impl Detector {
     }
 
     // uncached detect
-    async fn _detect(&self, name: &str, mode: DetectMode) -> anyhow::Result<bool> {
-        let censored: Option<bool>;
+    async fn _detect(&self, name: &str, mode: DetectMode) -> anyhow::Result<State> {
+        let mut state = State {
+            name: name.to_string(),
+            censored: fastrand::bool(),
+            time: SystemTime::now()
+        };
+ 
+        let mut censored: bool;
 
         let query: Vec<u8> = {
             use dns_parser::QueryType;
@@ -147,14 +198,14 @@ impl Detector {
                 match det.read(&mut recv).await {
                     Ok(size) => {
                         if size <= 0 {
-                            censored = Some(true);
+                            state.censored = true;
                         } else {
-                            censored = Some(false);
+                            state.censored = false;
                         }
-                    }
+                   }
                     Err(error) => {
                         println!("DEBUG detecting tcp mode: tcp socket error: {:?}", error);
-                        censored = Some(true);
+                        state.censored = true;
                     }
                 }
             }
@@ -171,6 +222,7 @@ impl Detector {
                     "192.58.128.30:53",
                     //"202.12.27.33:53",
                 ];
+
                 let det = UdpSocket::bind("[::]:0").await?;
                 for ip in servers {
                     det.send_to(&query, ip).await?;
@@ -186,23 +238,22 @@ impl Detector {
                     if let Ok(pkt) = DNSPacket::parse(&msg[..len]) {
                         use dns_parser::{rdata::RData, Class};
                         if pkt.answers.len() <= 0 {
-                            return Ok(false);
+                            state.censored = false;
                         }
                         if pkt.answers[0].cls != Class::CH {
-                            return Ok(true);
+                            state.censored = true;
                         }
-                        return {
+
+                        state.censored = 
                             match pkt.answers[0].data {
-                                RData::A(_) => Ok(true),
-                                RData::AAAA(_) => Ok(true),
-                                _ => Err(anyhow::Error::msg(format!(
-                                    "unsure wether domain {:?} censored... {:?}",
-                                    name, pkt
-                                ))),
-                            }
-                        };
+                                RData::A(_) => true,
+                                RData::AAAA(_) => true,
+                                _ => {
+                                    return Err(anyhow::Error::msg(format!("unsure wether domain {:?} censored... {:?}", name, pkt)))
+                                },
+                            };
                     } else {
-                        return Ok(false);
+                        state.censored = false;
                     }
                 } else {
                     return Err(anyhow::Error::msg(
