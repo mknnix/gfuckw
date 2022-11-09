@@ -15,4 +15,5 @@ dns-parser = "0.8.0"
 clap = { version = "3.2.22", features = ["derive"] }
 fastrand = "1.8.0"
 smol-timeout = "0.6.0"
+rusqlite = "0.28.0"
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 //use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 //use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use dns_parser::Packet as DNSPacket;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,10 +14,12 @@ use clap::Parser;
 use fastrand;
 
 use rusqlite;
-const DB_EXEC_SQL_TABLE: &str = "CREATE TABLE IF NOT EXISTS stat (name TEXT NOT NULL PRIMARY KEY, censored INT NOT NULL, timestamp INT NOT NULL);";
+use rusqlite::OptionalExtension;
+
+const DB_EXEC_SQL_TABLE: &str = "CREATE TABLE IF NOT EXISTS stat (name TEXT NOT NULL UNIQUE, censored INT NOT NULL, timestamp INT NOT NULL);";
 const DB_EXEC_SQL_SELECT: &str = "SELECT * FROM stat WHERE name = ? LIMIT 1;";
 
-const STATE_TIMEOUT_SEC: usize = 86400;
+const STATE_TTL_SEC: usize = 86400;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
@@ -45,6 +47,12 @@ struct Args {
     #[clap(long)]
     /// For now it accepts value of "tcp-rst" or "root-ns".
     detect_mode: String,
+
+    #[clap(long)]
+    /// Path to the optional Sqlite 3.x Database file.
+    /// if does not specify one, then in-memory db will be used.
+    /// if you provide one, then try to open that file with read-write access (abort and exit process if open fails).
+    database: Option<String>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -72,7 +80,7 @@ pub struct Detector {
     db: rusqlite::Connection,
 }
 impl Detector {
-    pub fn new(db_path: &str,mode: DetectMode, timeout: Duration) -> Self {
+    pub fn new(db_path: &str, mode: DetectMode, timeout: Duration) -> Self {
         let db = if db_path.len() <= 0 {
             rusqlite::Connection::open_in_memory().unwrap()
         } else {
@@ -89,12 +97,15 @@ impl Detector {
     }
 
     fn db_cached(&self, name: &str) -> Option<State> {
-        let res: Option<State> = match self.db.execute( DB_EXEC_SQL_SELECT, [name] ) {
-            Ok(lines) => {
-                lines[0]
-            },
-            Err(e) => {},
-        };
+        let state: Option<State> = self.db.query_row(
+            DB_EXEC_SQL_SELECT,
+            [ name ],
+            |line| Ok(State {
+                    name: line[0],
+                    censored: line[1],
+                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(line[2])
+                })
+        ).optional().unwrap();
         if res.is_none() {
             println!("INFO sqlite3.db: getting {:?} is not hit");
         } else {
@@ -106,14 +117,16 @@ impl Detector {
 
     // Cache-able and Paraell-able Censoring detect method, based on SQLite
     pub async fn db_censored(&self, name: &str) -> anyhow::Result<State> {
-        if let Some(lines) = db_cached(name) {
-            return;
+        if let Some(st) = db_cached(name) {
+            return Ok(st);
         }
 
         let r = self._detect();
+        self.db
     }
 
     // detect cached
+    /*
     pub async fn is_censored(&mut self, name: &str) -> anyhow::Result<State> {
         let mut name = name.to_string();
         name.make_ascii_lowercase();
@@ -143,6 +156,7 @@ impl Detector {
             Ok(wether)
         }
     }
+    */
 
     // uncached detect
     async fn _detect(&self, name: &str, mode: DetectMode) -> anyhow::Result<State> {
@@ -151,8 +165,6 @@ impl Detector {
             censored: fastrand::bool(),
             time: SystemTime::now()
         };
- 
-        let mut censored: bool;
 
         let query: Vec<u8> = {
             use dns_parser::QueryType;
@@ -265,7 +277,7 @@ impl Detector {
             }
         }
 
-        Ok(censored.unwrap())
+        Ok(state)
     }
 }
 
