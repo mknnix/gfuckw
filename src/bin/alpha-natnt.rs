@@ -1,4 +1,5 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, IpAddr, Ipv4Addr, UdpSocket};
+use std::thread;
 
 fn rand() -> u64 {
     use std::collections::hash_map::RandomState;
@@ -7,16 +8,56 @@ fn rand() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 
-const UDPN: u64 = 16;
+const THREADS: u64 = 16;
 
-fn udps_new() -> Vec<UdpSocket> {
+/*fn udps_new() -> Vec<UdpSocket> {
     let mut a = vec![];
     for _ in 0..UDPN {
         a.push(UdpSocket::bind("0.0.0.0:0").unwrap());
     }
-    a
+}*/
+
+fn rand_sendto() -> (Vec<u8>, SocketAddr) {
+    loop {
+        let r = rand().to_ne_bytes();
+        let ip = Ipv4Addr::new(r[0], r[1], r[2], r[3]);
+        if ip.is_unspecified() || ip.is_loopback() || ip.is_private() || ip.is_link_local() {
+            continue;
+        }
+
+        #[cfg(feature = "nightly")]
+        if ! ip.is_global() {
+            continue;
+        }
+
+        let port = u16::from_ne_bytes([ r[4], r[5] ]);
+        let addr = SocketAddr::new(IpAddr::V4(ip), port);
+
+        return (vec![ r[6] ], addr);
+    }
 }
 
+fn main() {
+    let mut thrs = vec![];
+    for _ in 0..THREADS {
+        thrs.push( thread::spawn(||{
+            loop {
+                let s = UdpSocket::bind("0.0.0.0:0").unwrap();
+
+                for _ in 0..1000 {
+                    let tmp = rand_sendto();
+                    println!("{:?}", s.send_to(&tmp.0, tmp.1));
+                }
+            }
+        }) );
+    }
+
+    for thr in thrs {
+        println!("{:?}", thr.join());
+    }
+}
+
+/*
 fn main() {
     let mut count: u128 = 0;
     let mut udps: Vec<UdpSocket> = udps_new();
@@ -41,5 +82,5 @@ fn main() {
                 )
         ) );
     }
-}
+}*/
 
