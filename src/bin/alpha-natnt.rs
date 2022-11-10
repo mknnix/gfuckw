@@ -8,7 +8,7 @@ fn rand() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 
-const THREADS: u64 = 16;
+const THREADS: u64 = 60000;
 
 /*fn udps_new() -> Vec<UdpSocket> {
     let mut a = vec![];
@@ -39,14 +39,16 @@ fn rand_sendto() -> (Vec<u8>, SocketAddr) {
 
 fn main() {
     let mut thrs = vec![];
-    for _ in 0..THREADS {
-        thrs.push( thread::spawn(||{
+    for n in 0..THREADS {
+        thrs.push( thread::spawn(move ||{
+            println!("thread {} started", n);
             loop {
                 let s = UdpSocket::bind("0.0.0.0:0").unwrap();
 
                 for _ in 0..1000 {
                     let tmp = rand_sendto();
-                    println!("{:?}", s.send_to(&tmp.0, tmp.1));
+                    let result = s.send_to(&tmp.0, tmp.1);
+                    //println!("{:?} => {:?}", result, tmp.1);
                 }
             }
         }) );
